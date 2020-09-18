@@ -3,15 +3,6 @@
 const MongoClient = require('mongodb')
 const { mergeMongoOptions } = require('./helper')
 
-function withCallback(promise, cb) {
-  // Assume that cb is a function - type checks and handling type errors
-  // can be done by caller
-  if (cb) {
-    promise.then(res => cb(null, res)).catch(cb)
-  }
-  return promise
-}
-
 function defaultSerializeFunction(session) {
   // Copy each property of the session to a new object
   const obj = {}
@@ -200,23 +191,6 @@ module.exports = function(connect) {
       return this
     }
 
-    collectionReady() {
-      let promise = this.collectionReadyPromise
-      if (!promise) {
-        promise = new Promise((resolve, reject) => {
-          if (this.state === 'connected') {
-            return resolve(this.collection)
-          }
-          if (this.state === 'connecting') {
-            return this.once('connected', () => resolve(this.collection))
-          }
-          reject(new Error('Not connected'))
-        })
-        this.collectionReadyPromise = promise
-      }
-      return promise
-    }
-
     computeStorageId(sessionId) {
       if (
         this.options.transformId &&
@@ -229,39 +203,34 @@ module.exports = function(connect) {
 
     /* Public API */
 
-    get(sid, callback) {
-      return withCallback(
-        this.collectionReady()
-          .then(collection =>
-            collection.findOne({
-              _id: this.computeStorageId(sid),
-              $or: [
-                { expires: { $exists: false } },
-                { expires: { $gt: new Date() } },
-              ],
-            })
+    async get(sid, callback) {
+      const session = await this.collection.findOne({
+        _id: this.computeStorageId(sid),
+        $or: [
+          { expires: { $exists: false } },
+          { expires: { $gt: new Date() } },
+        ],
+      })
+      // console.log(session);
+
+      if (session) {
+        if (this.Crypto) {
+          const tmpSession = this.transformFunctions.unserialize(
+            session.session
           )
-          .then(session => {
-            if (session) {
-              if (this.Crypto) {
-                const tmpSession = this.transformFunctions.unserialize(
-                  session.session
-                )
-                session.session = this.Crypto.get(tmpSession)
-              }
-              const s = this.transformFunctions.unserialize(session.session)
-              if (this.options.touchAfter > 0 && session.lastModified) {
-                s.lastModified = session.lastModified
-              }
-              this.emit('get', sid)
-              return s
-            }
-          }),
-        callback
-      )
+          session.session = this.Crypto.get(tmpSession)
+        }
+        const s = this.transformFunctions.unserialize(session.session)
+        if (this.options.touchAfter > 0 && session.lastModified) {
+          s.lastModified = session.lastModified
+        }
+        this.emit('get', sid)
+        if (callback) callback(null, s)
+        return s
+      }
     }
 
-    set(sid, session, callback) {
+    async set(sid, session, callback) {
       // Removing the lastModified prop from the session object before update
       if (this.options.touchAfter > 0 && session && session.lastModified) {
         delete session.lastModified
@@ -273,7 +242,7 @@ module.exports = function(connect) {
         try {
           session = this.Crypto.set(session)
         } catch (error) {
-          return withCallback(Promise.reject(error), callback)
+          callback(null, error)
         }
       }
 
@@ -283,7 +252,7 @@ module.exports = function(connect) {
           session: this.transformFunctions.serialize(session),
         }
       } catch (err) {
-        return withCallback(Promise.reject(err), callback)
+        callback(null, err)
       }
 
       if (session && session.cookie && session.cookie.expires) {
@@ -303,31 +272,26 @@ module.exports = function(connect) {
         s.lastModified = new Date()
       }
 
-      return withCallback(
-        this.collectionReady()
-          .then(collection =>
-            collection.updateOne(
-              { _id: this.computeStorageId(sid) },
-              { $set: s },
-              Object.assign({ upsert: true }, this.writeOperationOptions)
-            )
-          )
-          .then(rawResponse => {
-            if (rawResponse.result) {
-              rawResponse = rawResponse.result
-            }
-            if (rawResponse && rawResponse.upserted) {
-              this.emit('create', sid)
-            } else {
-              this.emit('update', sid)
-            }
-            this.emit('set', sid)
-          }),
-        callback
+      let rawResponse = await this.collection.updateOne(
+        { _id: this.computeStorageId(sid) },
+        { $set: s },
+        Object.assign({ upsert: true }, this.writeOperationOptions)
       )
+
+      if (rawResponse.result) {
+        rawResponse = rawResponse.result
+      }
+      if (rawResponse && rawResponse.upserted) {
+        this.emit('create', sid)
+      } else {
+        this.emit('update', sid)
+      }
+      this.emit('set', sid)
+
+      if (callback) callback(null)
     }
 
-    touch(sid, session, callback) {
+    async touch(sid, session, callback) {
       const updateFields = {}
       const touchAfter = this.options.touchAfter * 1000
       const lastModified = session.lastModified
@@ -342,7 +306,7 @@ module.exports = function(connect) {
         const timeElapsed = currentDate.getTime() - session.lastModified
 
         if (timeElapsed < touchAfter) {
-          return withCallback(Promise.resolve(), callback)
+          if (callback) callback(null)
         }
         updateFields.lastModified = currentDate
       }
@@ -353,89 +317,61 @@ module.exports = function(connect) {
         updateFields.expires = new Date(Date.now() + this.ttl * 1000)
       }
 
-      return withCallback(
-        this.collectionReady()
-          .then(collection =>
-            collection.updateOne(
-              { _id: this.computeStorageId(sid) },
-              { $set: updateFields },
-              this.writeOperationOptions
-            )
-          )
-          .then(result => {
-            if (result.nModified === 0) {
-              throw new Error('Unable to find the session to touch')
-            } else {
-              this.emit('touch', sid, session)
-            }
-          }),
-        callback
+      const result = await this.collection.updateOne(
+        { _id: this.computeStorageId(sid) },
+        { $set: updateFields },
+        this.writeOperationOptions
       )
+
+      if (result.nModified === 0) {
+        throw new Error('Unable to find the session to touch')
+      } else {
+        this.emit('touch', sid, session)
+      }
+
+      if (callback) callback(null)
     }
 
-    all(callback) {
-      return withCallback(
-        this.collectionReady()
-          .then(collection =>
-            collection.find({
-              $or: [
-                { expires: { $exists: false } },
-                { expires: { $gt: new Date() } },
-              ],
-            })
-          )
-          .then(sessions => {
-            return new Promise((resolve, reject) => {
-              const results = []
-              sessions.forEach(
-                session =>
-                  results.push(
-                    this.transformFunctions.unserialize(session.session)
-                  ),
-                err => {
-                  if (err) {
-                    reject(err)
-                  }
-                  this.emit('all', results)
-                  resolve(results)
-                }
-              )
-            })
-          }),
-        callback
-      )
+    async all(callback) {
+      const sessions = await this.collection
+        .find({
+          $or: [
+            { expires: { $exists: false } },
+            { expires: { $gt: new Date() } },
+          ],
+        })
+        .toArray()
+
+      const results = []
+      for (const session of sessions) {
+        results.push(this.transformFunctions.unserialize(session.session))
+      }
+
+      this.emit('all', results)
+
+      if (callback) callback(null, results)
+      return results
     }
 
-    destroy(sid, callback) {
-      return withCallback(
-        this.collectionReady()
-          .then(collection =>
-            collection.deleteOne(
-              { _id: this.computeStorageId(sid) },
-              this.writeOperationOptions
-            )
-          )
-          .then(() => this.emit('destroy', sid)),
-        callback
+    async destroy(sid, callback) {
+      await this.collection.deleteOne(
+        { _id: this.computeStorageId(sid) },
+        this.writeOperationOptions
       )
+
+      this.emit('destroy', sid)
+      if (callback) callback(null)
     }
 
-    length(callback) {
-      return withCallback(
-        this.collectionReady().then(collection =>
-          collection.countDocuments({})
-        ),
-        callback
-      )
+    async length(callback) {
+      const len = await this.collection.countDocuments()
+      if (callback) callback(null, len)
+      return len
     }
 
     clear(callback) {
-      return withCallback(
-        this.collectionReady().then(collection =>
-          collection.drop(this.writeOperationOptions)
-        ),
-        callback
-      )
+      this.collection.drop(this.writeOperationOptions)
+      if (callback) callback()
     }
 
     close() {

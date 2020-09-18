@@ -543,10 +543,14 @@ describe('legacy tests', () => {
       const data = makeData()
       await store.set(sid, data)
       const session = await collection.findOne({ _id: sid })
-      const lastModifiedBeforeTouch = session.lastModified.getTime()
+      const lastModifiedBeforeTouch = Math.floor(
+        session.lastModified.getTime() / 1000
+      )
       await store.touch(sid, session)
       const session2 = await collection.findOne({ _id: sid })
-      const lastModifiedAfterTouch = session2.lastModified.getTime()
+      const lastModifiedAfterTouch = Math.floor(
+        session2.lastModified.getTime() / 1000
+      )
       assert.strictEqual(lastModifiedBeforeTouch, lastModifiedAfterTouch)
       cleanup(store, collection, done)
     })
